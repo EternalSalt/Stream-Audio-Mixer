@@ -36,6 +36,7 @@ jobs:
         run: >
           pyinstaller --noconsole --onefile --name SonarLite
           --add-binary "SoundVolumeView.exe;."
+          --add-data "version.txt;."
           --collect-all sounddevice
           --collect-submodules pycaw
           --collect-submodules comtypes
