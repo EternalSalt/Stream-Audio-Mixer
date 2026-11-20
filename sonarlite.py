@@ -7,13 +7,17 @@ NirSoft SoundVolumeView). Each channel's audio is captured and played to TWO
 real output devices with independent volume / mute.
 """
 import csv
+import faulthandler
 import json
+import traceback
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import re
 import threading
+import urllib.request
 import uuid
 from ctypes import POINTER, cast
 from pathlib import Path
@@ -21,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import psutil
 import sounddevice as sd
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 import comtypes
@@ -251,6 +255,119 @@ def list_audio_apps():
 
 
 # --------------------------------------------------------------------------
+# Self-updater (GitHub releases)
+# --------------------------------------------------------------------------
+OWNER, REPO = "EternalSalt", "Stream-Audio-Mixer"
+FROZEN = bool(getattr(sys, "frozen", False))
+
+
+def read_version():
+    for p in (HERE / "version.txt", EXE_DIR / "version.txt"):
+        try:
+            return p.read_text().strip()
+        except Exception:
+            pass
+    return "0.0.0"
+
+
+VERSION = read_version()
+
+
+def vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:4]) or (0,)
+
+
+def cleanup_leftovers():
+    if FROZEN:
+        for suffix in (".new", ".old"):
+            try:
+                Path(sys.executable + suffix).unlink()
+            except Exception:
+                pass
+
+
+class Updater(QtCore.QObject):
+    status = QtCore.Signal(str)
+    available = QtCore.Signal(str, str, int)  # version, url, size
+    progress = QtCore.Signal(int)
+    ready = QtCore.Signal(str)
+    failed = QtCore.Signal(str)
+
+    def check(self, silent=False):
+        threading.Thread(target=self._check, args=(silent,), daemon=True).start()
+
+    def _check(self, silent):
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest",
+                headers={"User-Agent": "SonarLite", "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.load(r)
+            tag = data["tag_name"].lstrip("vV")
+            asset = next((a for a in data.get("assets", []) if a["name"] == "SonarLite-Portable.exe"), None)
+            if asset and vtuple(tag) > vtuple(VERSION):
+                self.available.emit(tag, asset["browser_download_url"], int(asset["size"]))
+            elif not silent:
+                self.status.emit(f"You're up to date (v{VERSION})")
+        except Exception as e:  # noqa
+            if not silent:
+                self.failed.emit(f"Update check failed: {e}")
+
+    def download(self, url, size):
+        threading.Thread(target=self._download, args=(url, size), daemon=True).start()
+
+    def _download(self, url, size):
+        try:
+            if not FROZEN:
+                raise RuntimeError("self-update only works in the built .exe")
+            dest = Path(sys.executable + ".new")
+            req = urllib.request.Request(url, headers={"User-Agent": "SonarLite"})
+            got = 0
+            with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if size:
+                        self.progress.emit(min(100, int(got * 100 / size)))
+            if size and got != size:
+                raise IOError("download incomplete")
+            with open(dest, "rb") as f:
+                if f.read(2) != b"MZ":
+                    raise IOError("downloaded file is not a valid .exe")
+            self.ready.emit(str(dest))
+        except PermissionError:
+            self.failed.emit("Can't write to the app's folder. Move SonarLite somewhere you own and retry.")
+        except Exception as e:  # noqa
+            self.failed.emit(f"Download failed: {e}")
+
+
+def launch_swap(new_path):
+    """Detached helper: wait for this exe to unlock, replace it, relaunch, delete itself."""
+    target = sys.executable
+    bat = Path(tempfile.gettempdir()) / "sonarlite_update.bat"
+    bat.write_text(
+        "@echo off\r\n"
+        "set n=0\r\n"
+        ":retry\r\n"
+        f'move /Y "{new_path}" "{target}" >nul 2>&1\r\n'
+        "if not errorlevel 1 goto done\r\n"
+        "set /a n+=1\r\n"
+        "if %n% GEQ 90 exit /b 1\r\n"
+        "ping -n 2 127.0.0.1 >nul\r\n"
+        "goto retry\r\n"
+        ":done\r\n"
+        f'start "" "{target}"\r\n'
+        'del "%~f0"\r\n')
+    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"  # new instance must not reuse our temp dir
+    subprocess.Popen(["cmd", "/c", str(bat)], env=env, cwd=tempfile.gettempdir(),
+                     creationflags=0x08000000 | 0x00000200, close_fds=True)
+
+
+# --------------------------------------------------------------------------
 # GUI
 # --------------------------------------------------------------------------
 STYLE = """
@@ -298,10 +415,15 @@ class AppList(QtWidgets.QListWidget):
         self.setDefaultDropAction(Qt.CopyAction)
         self.setMinimumHeight(120)
 
-    def mimeData(self, items):
+    def startDrag(self, supportedActions):
+        item = self.currentItem()
+        if item is None:
+            return
         md = QtCore.QMimeData()
-        md.setText(items[0].data(Qt.UserRole) if items else "")
-        return md
+        md.setText(item.data(Qt.UserRole) or "")
+        drag = QtGui.QDrag(self)
+        drag.setMimeData(md)
+        drag.exec(Qt.CopyAction)  # copy only: Qt never deletes our items
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasText():
@@ -473,7 +595,7 @@ class ChannelCard(QtWidgets.QFrame):
 class Main(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SonarLite")
+        self.setWindowTitle(f"SonarLite v{VERSION}")
         self.resize(1250, 780)
         self.cfg = self.load()
         self.router = Router()
@@ -490,6 +612,19 @@ class Main(QtWidgets.QWidget):
         rescan = QtWidgets.QPushButton("Rescan devices")
         rescan.clicked.connect(self.rebuild)
         left.addWidget(rescan)
+        self.up_btn = QtWidgets.QPushButton("Check for updates")
+        self.up_btn.clicked.connect(self.on_update_click)
+        left.addWidget(self.up_btn)
+        self.up_bar = QtWidgets.QProgressBar()
+        self.up_bar.setRange(0, 100)
+        self.up_bar.setFixedHeight(8)
+        self.up_bar.setTextVisible(False)
+        self.up_bar.hide()
+        left.addWidget(self.up_bar)
+        self.up_lbl = QtWidgets.QLabel(f"v{VERSION}")
+        self.up_lbl.setObjectName("hint")
+        self.up_lbl.setWordWrap(True)
+        left.addWidget(self.up_lbl)
         self.hint = QtWidgets.QLabel("")
         self.hint.setObjectName("status")
         self.hint.setWordWrap(True)
@@ -515,6 +650,64 @@ class Main(QtWidgets.QWidget):
         m.timeout.connect(lambda: [c.tick() for c in self.cards.values()])
         m.start(40)
         self.poll()
+
+        self.up_state, self.up_info = "idle", None
+        self.up = Updater()
+        self.up.status.connect(self.up_lbl.setText)
+        self.up.available.connect(self.on_update_available)
+        self.up.progress.connect(self.up_bar.setValue)
+        self.up.ready.connect(self.on_update_ready)
+        self.up.failed.connect(self.on_update_failed)
+        cleanup_leftovers()
+        QtCore.QTimer.singleShot(3000, lambda: self.up.check(silent=True))
+
+    # -- updates -----------------------------------------------------------
+    def on_update_click(self):
+        if self.up_state == "available":
+            self.up_state = "downloading"
+            self.up_btn.setEnabled(False)
+            self.up_btn.setText("Downloading...")
+            self.up_bar.setValue(0)
+            self.up_bar.show()
+            self.up.download(self.up_info[1], self.up_info[2])
+        elif self.up_state == "ready":
+            self.finish_update()
+        elif self.up_state == "idle":
+            self.up_lbl.setText("Checking...")
+            self.up.check()
+
+    def on_update_available(self, ver, url, size):
+        self.up_state, self.up_info = "available", (ver, url, size)
+        self.up_btn.setText(f"Download && install v{ver}")
+        self.up_lbl.setText(f"v{VERSION} - update v{ver} available")
+
+    def on_update_ready(self, path):
+        self.up_state, self.up_path = "ready", path
+        self.up_bar.hide()
+        self.up_btn.setEnabled(True)
+        self.up_btn.setText("Restart to finish update")
+        self.up_lbl.setText("Update downloaded and ready.")
+        r = QtWidgets.QMessageBox.question(
+            self, "Update ready",
+            f"SonarLite v{self.up_info[0]} is downloaded.\nRestart now to finish? Audio pauses for a few seconds.")
+        if r == QtWidgets.QMessageBox.Yes:
+            self.finish_update()
+
+    def on_update_failed(self, msg):
+        self.up_state = "idle"
+        self.up_bar.hide()
+        self.up_btn.setEnabled(True)
+        self.up_btn.setText("Check for updates")
+        self.up_lbl.setText(msg)
+
+    def finish_update(self):
+        try:
+            launch_swap(self.up_path)
+        except Exception as e:  # noqa
+            self.on_update_failed(f"Couldn't start update: {e}")
+            return
+        self.close()
+        QtWidgets.QApplication.quit()
 
     # -- persistence -------------------------------------------------------
     def load(self):
@@ -591,7 +784,9 @@ class Main(QtWidgets.QWidget):
             self.router.set_app_async(None, proc)
             self.applied = {k for k in self.applied if k[0] != proc}
         self.save()
-        QtCore.QTimer.singleShot(0, lambda: (self.apply_assignments(), self.refresh_lists(True)))
+        self.apply_assignments()
+        self._sig = None
+        QtCore.QTimer.singleShot(250, self.refresh_lists)  # after the drag has fully ended
 
     def apply_assignments(self):
         for proc, pids in self.active.items():
@@ -644,6 +839,14 @@ class Main(QtWidgets.QWidget):
 
 
 def main():
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    log = open(APP_DIR / "crash.log", "a", buffering=1)
+    faulthandler.enable(file=log)
+
+    def hook(et, ev, tb):
+        log.write("".join(traceback.format_exception(et, ev, tb)) + "\n")
+
+    sys.excepthook = hook
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(STYLE)
     w = Main()
