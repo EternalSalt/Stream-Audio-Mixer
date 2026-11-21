@@ -1,4 +1,4 @@
-name: Build SonarLite
+name: Build Salty's Stream Mixer
 
 on:
   workflow_dispatch:
@@ -34,13 +34,13 @@ jobs:
 
       - name: Build portable app
         run: >
-          pyinstaller --noconsole --onefile --name SonarLite
+          pyinstaller --noconsole --onefile --name SaltysStreamMixer
           --add-binary "SoundVolumeView.exe;."
           --add-data "version.txt;."
           --collect-all sounddevice
           --collect-submodules pycaw
           --collect-submodules comtypes
-          sonarlite.py
+          saltys_stream_mixer.py
 
       - name: Read version
         id: v
@@ -52,20 +52,20 @@ jobs:
         run: |
           choco install innosetup -y --no-progress
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=${{ steps.v.outputs.version }} installer.iss
-          Copy-Item dist\SonarLite.exe dist\SonarLite-Portable.exe
+          Copy-Item dist\SaltysStreamMixer.exe dist\SaltysStreamMixer-Portable.exe
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.v.outputs.version }}
-          name: SonarLite ${{ steps.v.outputs.version }}
+          name: "Salty's Stream Mixer ${{ steps.v.outputs.version }}"
           body: |
-            **Windows:** download SonarLite-Setup.exe to install, or SonarLite-Portable.exe to run without installing.
+            **Windows:** download SaltysStreamMixer-Setup.exe to install, or SaltysStreamMixer-Portable.exe to run without installing.
             If Windows says "Windows protected your PC", click More info, then Run anyway.
 
-            **Before first use:** install virtual audio cables (VB-Cable or Voicemeeter), one per channel. Then in each channel's "Virtual device setup", set "Apps play to" to the cable's playback device and "Read from" to its recording side.
+            **Before first use:** install VB-Cable (vb-audio.com/Cable) and restart your PC. Each channel needs its own virtual cable.
           files: |
-            dist/SonarLite-Setup.exe
-            dist/SonarLite-Portable.exe
+            dist/SaltysStreamMixer-Setup.exe
+            dist/SaltysStreamMixer-Portable.exe
           fail_on_unmatched_files: true
           overwrite_files: true
