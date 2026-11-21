@@ -1,26 +1,35 @@
 # Salty's Stream Mixer (Windows 10/11)
 
-A per-app audio mixer. Every channel plays to **two outputs at once** (e.g. headphones + speakers),
-and you **drag apps between channels** to choose where each app plays.
+A Sonar-style mixer. The program becomes your PC's audio output, splits sound into channels
+(Game, Chat, Media, Aux, Mic), and sends the result to the outputs you choose.
 
 ## First-time setup
 1. Install **VB-Cable** from https://vb-audio.com/Cable/ and restart your PC.
-   Each channel needs its own cable. The free download gives you one; the A+B / C+D packs add more.
-2. Install Salty's Stream Mixer from the latest release (Setup.exe) or run the Portable.exe.
-3. On first launch the app assigns a cable to each channel, sets Output 1 to your normal speakers/headphones,
-   and makes the first channel your **Windows default output** (gold outline).
+   Each app channel needs its own cable: the free download gives 1, and the A+B / C+D packs add more
+   (4 app channels = 4 cables).
+2. Install Salty's Stream Mixer (Setup.exe from the latest release) or run Portable.exe.
+3. On first launch it assigns a cable to each channel, sets **Personal Mix** to your normal speakers/headphones,
+   and makes **Game** your Windows output.
 
-## Using it
-- **Windows default output (★):** everything on your PC plays through this channel. Click the star button
-  on another channel to switch. When you close the app, your original Windows output is restored.
-- **Apps:** each channel lists the apps playing through it. Drag an app to another channel to move it.
-- **Outputs:** pick two real devices per channel. Each has its own volume and mute.
-- **+ Add channel** adds more channels (each needs a free virtual cable).
+## The screen
+- **Master panel (left)**
+  - **Personal Mix** - the device you listen on (e.g. headphones). Required.
+  - **Stream Mix** - an optional second output (e.g. speakers or a stream device).
+  - **Mic Input** - your microphone; it feeds the Mic channel.
+  - **Windows output** - which channel everything on your PC plays through.
+- **Channels** - each has two faders: 🎧 Personal and 📡 Stream.
+  - The **dot** above a fader turns that channel on/off for that mix.
+  - The **speaker button** below mutes it in that mix.
+  - **Apps** lists the programs on that channel. Drag one to another channel to move it.
+  - **⚙** renames, picks the virtual cable, or removes the channel.
+- **+ Add channel** adds more (each needs a free virtual cable).
+
+Use one output or two: leave Stream Mix empty for one, or pick a device for both.
 
 ## If sound ever goes missing
-Re-open the app (it restores your output when closed normally), or choose your speakers in
-Windows Settings > System > Sound.
+Re-open the app (closing it normally restores your original Windows output), or choose your
+speakers in Windows Settings > System > Sound.
 
 ## For developers
-`pip install -r requirements.txt`, put `SoundVolumeView.exe` next to the script, run `python saltys_stream_mixer.py`.
-Config + crash log: `%APPDATA%\SaltysStreamMixer\`.
+`pip install -r requirements.txt`, put `SoundVolumeView.exe` next to the script, then
+`python saltys_stream_mixer.py`. Config + crash log: `%APPDATA%\SaltysStreamMixer\`.

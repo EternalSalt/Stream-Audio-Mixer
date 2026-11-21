@@ -1,11 +1,10 @@
 """
-Salty's Stream Mixer - per-app audio mixer for Windows 10/11.
+Salty's Stream Mixer - a Sonar-style audio mixer for Windows 10/11.
 
-* Every channel uses its own virtual audio cable (VB-Cable).
-* One channel is the "Windows default": the app makes it the PC's default
-  output, so everything plays through the mixer.
-* Drag an app to another channel to route just that app there.
-* Every channel plays to TWO real outputs at once (e.g. headphones + speakers).
+* Each channel (Game, Chat, Media, Aux...) is a virtual audio cable that apps play into.
+* Two mixes: Personal Mix and Stream Mix. Each plays to the output device you choose.
+* Every channel has a fader + on/off + mute for each mix. The Mic channel feeds the mixes too.
+* The first channel is the Windows default output; drag apps between channels to route them.
 """
 import csv
 import faulthandler
@@ -55,7 +54,7 @@ else:
 
 
 # --------------------------------------------------------------------------
-# Audio engine: one capture device -> two output devices
+# Audio engine: channels (capture) -> two mix buses (output devices)
 # --------------------------------------------------------------------------
 class Ring:
     def __init__(self, cap=SR):
@@ -82,6 +81,10 @@ class Ring:
             self.w = end % self.cap
             self.n += m
 
+    def clear(self):
+        with self.lock:
+            self.r = self.w = self.n = 0
+
     def read(self, m):
         out = np.zeros((m, 2), np.float32)
         with self.lock:
@@ -103,59 +106,91 @@ class Ring:
         return out
 
 
-class Engine:
+class ChannelAudio:
+    """One input (virtual cable or mic) feeding both mix buses."""
+
     def __init__(self):
         self.rings = [Ring(), Ring()]
+        self.on = [True, True]
         self.gain = [1.0, 1.0]
         self.mute = [False, False]
+        self.stream = None
+
+    def start(self, in_idx):
+        self.stop()
+        ws = sd.WasapiSettings(auto_convert=True)
+        last = "unknown error"
+        for nch in (2, 1):
+            def cb(indata, frames, t, status, nch=nch):
+                x = np.repeat(indata, 2, axis=1) if nch == 1 else indata
+                for i in (0, 1):
+                    if self.on[i]:
+                        self.rings[i].write(x)
+            try:
+                s = sd.InputStream(device=in_idx, channels=nch, samplerate=SR, blocksize=BLOCK,
+                                   dtype="float32", callback=cb, extra_settings=ws)
+                s.start()
+                self.stream = s
+                return None
+            except Exception as e:  # noqa
+                last = str(e)
+        return last
+
+    def stop(self):
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+        self.stream = None
+
+
+class Bus:
+    """A mix (Personal / Stream): sums every channel and plays it to one output device."""
+
+    def __init__(self, i):
+        self.i = i
+        self.channels = []
         self.master = 1.0
         self.level = 0.0
-        self.active = [False, False]
-        self.streams = []
+        self.stream = None
 
-    def start(self, in_idx, out_idxs):
+    def start(self, dev_idx):
         self.stop()
-        self.rings = [Ring(), Ring()]
-        self.active = [i is not None for i in out_idxs]
-        ws = sd.WasapiSettings(auto_convert=True)
+        if dev_idx is None:
+            return None
+        i = self.i
 
-        def in_cb(indata, frames, t, status):
-            self.level = max(self.level, float(np.abs(indata).max()))
-            for i in (0, 1):
-                if self.active[i]:
-                    self.rings[i].write(indata)
-
-        def make_out_cb(i):
-            def cb(outdata, frames, t, status):
-                g = 0.0 if self.mute[i] else self.gain[i] * self.master
-                outdata[:] = np.clip(self.rings[i].read(frames) * g, -1.0, 1.0)
-            return cb
+        def cb(outdata, frames, t, status):
+            acc = np.zeros((frames, 2), np.float32)
+            for c in self.channels:
+                if c.on[i]:
+                    d = c.rings[i].read(frames)
+                    if not c.mute[i]:
+                        acc += d * c.gain[i]
+            acc *= self.master
+            self.level = max(self.level, float(np.abs(acc).max()))
+            np.clip(acc, -1.0, 1.0, out=acc)
+            outdata[:] = acc
 
         try:
-            for i, idx in enumerate(out_idxs):
-                if idx is None:
-                    continue
-                s = sd.OutputStream(device=idx, channels=2, samplerate=SR, blocksize=BLOCK,
-                                    dtype="float32", callback=make_out_cb(i), extra_settings=ws)
-                s.start()
-                self.streams.append(s)
-            s = sd.InputStream(device=in_idx, channels=2, samplerate=SR, blocksize=BLOCK,
-                               dtype="float32", callback=in_cb, extra_settings=ws)
+            s = sd.OutputStream(device=dev_idx, channels=2, samplerate=SR, blocksize=BLOCK,
+                                dtype="float32", callback=cb, extra_settings=sd.WasapiSettings(auto_convert=True))
             s.start()
-            self.streams.append(s)
+            self.stream = s
             return None
         except Exception as e:  # noqa
-            self.stop()
             return str(e)
 
     def stop(self):
-        for s in self.streams:
+        if self.stream:
             try:
-                s.stop()
-                s.close()
+                self.stream.stop()
+                self.stream.close()
             except Exception:
                 pass
-        self.streams = []
+        self.stream = None
 
 
 # --------------------------------------------------------------------------
@@ -409,52 +444,72 @@ def launch_swap(new_path):
 # --------------------------------------------------------------------------
 STYLE = """
 * { color:#e8eaee; font-family:"Segoe UI",sans-serif; font-size:13px; }
-QWidget#root { background:#14161b; }
+QWidget#root { background:#1a1d24; }
 QLabel, QCheckBox { background:transparent; }
 QScrollArea, QScrollArea > QWidget > QWidget { background:transparent; border:none; }
 
-QFrame#header { background:#1a1d24; border-bottom:1px solid #2a2e38; }
-QLabel#appTitle { font-size:20px; font-weight:700; }
-QLabel#hint { color:#8b93a5; }
-QLabel#banner { background:#3a2f12; color:#ffd479; border-radius:8px; padding:8px 12px; }
-QLabel#footer { color:#8b93a5; padding:2px 4px; }
-
-QFrame#card { background:#1c1f27; border:1px solid #2b303b; border-radius:12px; }
-QFrame#card[isDefault="true"] { border:1px solid #e0b341; }
-QFrame#outbox { background:#15181e; border-radius:8px; }
+QFrame#master { background:#14171d; border-right:1px solid #262b34; }
+QLabel#masterTitle { font-size:20px; font-weight:800; color:#5b7cff; }
+QLabel#appName { color:#8b93a5; }
 QLabel#caption { color:#8b93a5; font-size:11px; font-weight:700; letter-spacing:1px; }
-QLabel#status { color:#ff8a7a; }
-QLineEdit#title { background:transparent; border:none; font-size:17px; font-weight:700; padding:0; }
-QLineEdit#title:focus { border-bottom:1px solid #5b7cff; }
+QLabel#hint { color:#8b93a5; font-size:12px; }
+QLabel#err { color:#ff8a7a; font-size:12px; }
+QLabel#banner { background:#3a2f12; color:#ffd479; border-radius:8px; padding:8px 10px; font-size:12px; }
+
+QFrame#channel { background:#252a33; border-right:1px solid #1a1d24; }
+QFrame#chHead { background:#1f232b; }
+QLabel#chName { font-size:14px; font-weight:800; letter-spacing:1px; }
+QLabel#tag { color:#e0b341; font-size:10px; font-weight:700; }
+QLabel#note { color:#ff8a7a; font-size:11px; }
 
 QPushButton { background:#2a2e38; border:1px solid #3a3f4d; border-radius:6px; padding:5px 12px; }
 QPushButton:hover { background:#343947; }
 QPushButton:disabled { color:#6b7285; }
 QPushButton#primary { background:#4a63c0; border-color:#5b7cff; font-weight:600; }
 QPushButton#primary:hover { background:#5873d6; }
-QPushButton#defaultBtn { text-align:left; padding:6px 10px; }
-QPushButton#defaultBtn[isDefault="true"] { background:#4a3d12; border-color:#e0b341; color:#ffd479; font-weight:600; }
-QPushButton#muteBtn { padding:4px 8px; min-width:44px; }
+QPushButton#gear { background:#2b303a; border:none; border-radius:13px; padding:0; min-width:26px; max-width:26px; min-height:26px; max-height:26px; }
+QPushButton#gear:hover { background:#3a4050; }
+QPushButton#dot { background:#555b69; border:none; border-radius:6px; padding:0; min-width:12px; max-width:12px; min-height:12px; max-height:12px; }
+QPushButton#muteBtn { padding:0; background:#2b303a; border:1px solid #3a3f4d; border-radius:5px; }
 QPushButton#muteBtn:checked { background:#b3412f; border-color:#d9604c; }
-QPushButton#close { padding:2px 6px; min-width:22px; background:transparent; border:none; color:#8b93a5; }
-QPushButton#close:hover { color:#ff8a7a; }
+QPushButton#addCh { background:transparent; border:2px dashed #353b48; border-radius:10px; color:#8b93a5; padding:0; }
+QPushButton#addCh:hover { border-color:#5b7cff; color:#e8eaee; }
 
-QComboBox { background:#2a2e38; border:1px solid #3a3f4d; border-radius:6px; padding:4px 8px; }
-QComboBox:hover { background:#343947; }
-QComboBox QAbstractItemView { background:#14161b; selection-background-color:#3b4a8a; border:1px solid #3a3f4d; }
+QComboBox { background:#262b34; border:1px solid #3a3f4d; border-radius:6px; padding:5px 8px; }
+QComboBox:hover { background:#2f3540; }
+QComboBox[needs="true"] { border:1px solid #e5484d; }
+QComboBox QAbstractItemView { background:#14171d; selection-background-color:#3b4a8a; border:1px solid #3a3f4d; }
+QMenu { background:#1c1f27; border:1px solid #3a3f4d; padding:4px; }
+QMenu::item { padding:6px 18px; border-radius:4px; }
+QMenu::item:selected { background:#3b4a8a; }
+QMenu::item:disabled { color:#6b7285; }
 
-QListWidget { background:#14161b; border:1px dashed #3a3f4d; border-radius:8px; padding:4px; outline:none; }
-QListWidget::item { background:#27325a; border-radius:6px; padding:7px 8px; margin:2px; }
+QListWidget { background:#1a1d24; border:1px solid #1a1d24; border-radius:6px; padding:3px; outline:none; }
+QListWidget::item { background:#323a55; border-radius:5px; padding:6px 8px; margin:2px; }
 QListWidget::item:selected { background:#4a63c0; }
 
-QProgressBar { background:#101216; border:none; border-radius:3px; }
-QProgressBar::chunk { background:#3ecf8e; border-radius:3px; }
+QProgressBar { background:#0f1115; border:none; border-radius:2px; }
+QProgressBar::chunk { background:#3ecf8e; border-radius:2px; }
 QProgressBar#updateBar::chunk { background:#5b7cff; }
-QSlider::groove:horizontal { height:6px; background:#2c303a; border-radius:3px; }
+QSlider::groove:horizontal { height:6px; background:#0f1115; border-radius:3px; }
 QSlider::sub-page:horizontal { background:#5b7cff; border-radius:3px; }
-QSlider::handle:horizontal { width:14px; margin:-5px 0; background:#e8eaee; border-radius:7px; }
+QSlider::handle:horizontal { width:14px; margin:-5px 0; background:#f1f2f5; border-radius:7px; }
+QSlider::groove:vertical { width:6px; background:#12151a; border-radius:3px; }
+QSlider::sub-page:vertical { background:#12151a; border-radius:3px; }
+QSlider::add-page:vertical { background:#5b7cff; border-radius:3px; }
+QSlider::handle:vertical { height:18px; width:26px; margin:0 -10px; background:#f4f5f7; border-radius:4px; }
 QMessageBox, QDialog { background:#1c1f27; }
 """
+
+DEFAULT_CHANNELS = [  # name, icon, color, kind
+    ("Game", "🎮", "#19d3a2", "cable"),
+    ("Chat", "💬", "#2ea8ff", "cable"),
+    ("Media", "🎵", "#ff3d8b", "cable"),
+    ("Aux", "🔷", "#8b5cf6", "cable"),
+    ("Mic", "🎤", "#f5a524", "mic"),
+]
+EXTRA_COLORS = ["#e0b341", "#4ad0ff", "#ff7a59", "#9be564"]
+SCHEMA = 2
 
 
 def caption(text):
@@ -468,18 +523,24 @@ def repolish(w):
     w.style().polish(w)
 
 
-def make_combo(items, current, placeholder="- none -"):
-    """items: list of (label, data)."""
-    cb = QtWidgets.QComboBox()
-    cb.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
-    cb.setMinimumContentsLength(16)
-    cb.view().setMinimumWidth(380)
+def fill_combo(cb, items, current, placeholder):
+    """items: list of (label, data). Keeps a (missing) entry if the saved device is gone."""
+    cb.blockSignals(True)
+    cb.clear()
     cb.addItem(placeholder, "")
     for label, data in items:
         cb.addItem(label, data)
     if current and cb.findData(current) < 0:
         cb.addItem(f"(missing) {current}", current)
     cb.setCurrentIndex(max(cb.findData(current or ""), 0))
+    cb.blockSignals(False)
+
+
+def new_combo():
+    cb = QtWidgets.QComboBox()
+    cb.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+    cb.setMinimumContentsLength(14)
+    cb.view().setMinimumWidth(380)
     return cb
 
 
@@ -497,7 +558,7 @@ class AppList(QtWidgets.QListWidget):
         self.setAcceptDrops(True)
         self.setDragDropMode(QtWidgets.QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.CopyAction)
-        self.setMinimumHeight(110)
+        self.setMinimumHeight(90)
 
     def startDrag(self, supportedActions):
         item = self.currentItem()
@@ -529,190 +590,229 @@ class AppList(QtWidgets.QListWidget):
         if self.count() == 0:
             p = QtGui.QPainter(self.viewport())
             p.setPen(QtGui.QColor("#6b7285"))
-            p.drawText(self.viewport().rect(), Qt.AlignCenter | Qt.TextWordWrap,
-                       "No apps here.\nDrop an app on this box.")
+            p.drawText(self.viewport().rect(), Qt.AlignCenter | Qt.TextWordWrap, "Drop apps here")
 
 
-class ChannelCard(QtWidgets.QFrame):
+class ChannelWidget(QtWidgets.QFrame):
     changed = QtCore.Signal()
     removeRequested = QtCore.Signal(str)
-    defaultRequested = QtCore.Signal(str)
 
-    def __init__(self, ch, cables, ins, outs, taken_fn, can_remove):
+    def __init__(self, ch, cables, ins, taken_fn, can_remove):
         super().__init__()
-        self.setObjectName("card")
-        self.setFixedWidth(330)
-        self.ch, self.ins, self.outs, self.taken_fn = ch, ins, outs, taken_fn
-        self.engine = Engine()
-        self.lvl = 0.0
-        real_outs = [n for n in outs if n not in cables and not is_virtual(n)]
+        self.setObjectName("channel")
+        self.setFixedWidth(178)
+        self.ch, self.cables, self.ins = ch, cables, ins
+        self.taken_fn, self.can_remove = taken_fn, can_remove
+        self.audio = ChannelAudio()
+        col = ch["color"]
+        self.setStyleSheet(f"QLabel#chName{{color:{col};}} QSlider::add-page:vertical{{background:{col};}} "
+                           f"QPushButton#dot:checked{{background:{col};}}")
 
         v = QtWidgets.QVBoxLayout(self)
-        v.setContentsMargins(14, 14, 14, 14)
-        v.setSpacing(7)
+        v.setContentsMargins(0, 0, 0, 10)
+        v.setSpacing(6)
 
-        # --- header: name + remove
-        top = QtWidgets.QHBoxLayout()
-        self.name = QtWidgets.QLineEdit(ch["name"])
-        self.name.setObjectName("title")
-        self.name.setToolTip("Click to rename")
-        self.name.editingFinished.connect(self._cfg)
-        close = QtWidgets.QPushButton("✕")
-        close.setObjectName("close")
-        close.setToolTip("Remove channel")
-        close.setEnabled(can_remove)
-        close.clicked.connect(lambda: self.removeRequested.emit(self.ch["id"]))
-        top.addWidget(self.name, 1)
-        top.addWidget(close)
-        v.addLayout(top)
+        # header
+        head = QtWidgets.QFrame()
+        head.setObjectName("chHead")
+        hl = QtWidgets.QHBoxLayout(head)
+        hl.setContentsMargins(12, 10, 10, 10)
+        self.title = QtWidgets.QLabel()
+        self.title.setObjectName("chName")
+        gear = QtWidgets.QPushButton("⚙")
+        gear.setObjectName("gear")
+        gear.setToolTip("Channel settings")
+        gear.clicked.connect(self._gear)
+        hl.addWidget(self.title, 1)
+        hl.addWidget(gear)
+        v.addWidget(head)
 
-        self.default_btn = QtWidgets.QPushButton()
-        self.default_btn.setObjectName("defaultBtn")
-        self.default_btn.clicked.connect(lambda: self.defaultRequested.emit(self.ch["id"]))
-        v.addWidget(self.default_btn)
+        self.info = QtWidgets.QLabel("")
+        self.info.setWordWrap(True)
+        self.info.setAlignment(Qt.AlignCenter)
+        self.info.setFixedHeight(34)
+        v.addWidget(self.info)
+        self.is_default, self.note_text = False, ""
 
-        # --- virtual cable
-        v.addWidget(caption("Virtual cable"))
-        self.cable_cb = make_combo([(cable_label(c), c) for c in cables], ch["render"], "- choose a cable -")
-        self.cable_cb.currentIndexChanged.connect(self._cable_changed)
-        v.addWidget(self.cable_cb)
-
-        # --- apps
-        v.addWidget(caption("Apps on this channel"))
-        self.apps = AppList(ch["id"])
-        v.addWidget(self.apps, 1)
-
-        # --- volume
-        v.addWidget(caption("Channel volume"))
-        row = QtWidgets.QHBoxLayout()
-        self.master = QtWidgets.QSlider(Qt.Horizontal)
-        self.master.setRange(0, 100)
-        self.master.setValue(ch["vol"])
-        self.master.valueChanged.connect(self._gains)
-        self.master_lbl = QtWidgets.QLabel()
-        self.master_lbl.setMinimumWidth(34)
-        self.master_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        row.addWidget(self.master, 1)
-        row.addWidget(self.master_lbl)
-        v.addLayout(row)
-        self.meter = QtWidgets.QProgressBar()
-        self.meter.setRange(0, 100)
-        self.meter.setTextVisible(False)
-        self.meter.setFixedHeight(6)
-        v.addWidget(self.meter)
-
-        # --- two outputs
-        v.addWidget(caption("Plays through (both at once)"))
-        self.out_cb, self.out_sl, self.out_mute = [], [], []
-        for i in (0, 1):
-            box = QtWidgets.QFrame()
-            box.setObjectName("outbox")
-            bl = QtWidgets.QVBoxLayout(box)
-            bl.setContentsMargins(8, 8, 8, 8)
-            bl.setSpacing(5)
-            cb = make_combo([(n, n) for n in real_outs], ch["out"][i], f"Output {i + 1}: - none -")
-            cb.currentIndexChanged.connect(self._dev_changed)
-            r = QtWidgets.QHBoxLayout()
-            sl = QtWidgets.QSlider(Qt.Horizontal)
+        # two fader columns: Personal / Stream
+        faders = QtWidgets.QHBoxLayout()
+        faders.setContentsMargins(8, 0, 8, 0)
+        self.dot, self.sl, self.mute, self.icon = [], [], [], []
+        for i, (sym, tip) in enumerate((("🎧", "Personal Mix"), ("📡", "Stream Mix"))):
+            c = QtWidgets.QVBoxLayout()
+            c.setSpacing(7)
+            ic = QtWidgets.QLabel(sym)
+            ic.setAlignment(Qt.AlignCenter)
+            ic.setStyleSheet("font-size:18px;")
+            ic.setToolTip(tip)
+            dot = QtWidgets.QPushButton()
+            dot.setObjectName("dot")
+            dot.setCheckable(True)
+            dot.setChecked(ch["on"][i])
+            dot.setToolTip(f"Send this channel to {tip} (on/off)")
+            sl = QtWidgets.QSlider(Qt.Vertical)
             sl.setRange(0, 100)
-            sl.setValue(ch["ov"][i])
+            sl.setValue(ch["vol"][i])
+            sl.setMinimumHeight(190)
+            sl.setToolTip(f"{tip} volume")
+            mu = QtWidgets.QPushButton("🔊")
+            mu.setObjectName("muteBtn")
+            mu.setCheckable(True)
+            mu.setChecked(ch["mute"][i])
+            mu.setFixedSize(32, 26)
+            mu.setToolTip(f"Mute in {tip}")
+            dot.toggled.connect(lambda on, i=i: self._dot(i, on))
             sl.valueChanged.connect(self._gains)
-            m = QtWidgets.QPushButton("Mute")
-            m.setObjectName("muteBtn")
-            m.setCheckable(True)
-            m.setChecked(ch["mute"][i])
-            m.toggled.connect(self._gains)
-            r.addWidget(sl, 1)
-            r.addWidget(m)
-            bl.addWidget(cb)
-            bl.addLayout(r)
-            v.addWidget(box)
-            self.out_cb.append(cb)
-            self.out_sl.append(sl)
-            self.out_mute.append(m)
+            mu.toggled.connect(self._gains)
+            c.addWidget(ic, 0, Qt.AlignHCenter)
+            c.addWidget(dot, 0, Qt.AlignHCenter)
+            c.addWidget(sl, 1, Qt.AlignHCenter)
+            c.addWidget(mu, 0, Qt.AlignHCenter)
+            faders.addLayout(c, 1)
+            self.dot.append(dot)
+            self.sl.append(sl)
+            self.mute.append(mu)
+            self.icon.append(ic)
+        v.addLayout(faders, 1)
 
-        self.status = QtWidgets.QLabel("")
-        self.status.setObjectName("status")
-        self.status.setWordWrap(True)
-        v.addWidget(self.status)
+        # apps
+        if ch["type"] == "cable":
+            ap = QtWidgets.QLabel("Apps")
+            ap.setObjectName("hint")
+            ap.setContentsMargins(10, 0, 0, 0)
+            v.addWidget(ap)
+            self.apps = AppList(ch["id"])
+            lw = QtWidgets.QHBoxLayout()
+            lw.setContentsMargins(8, 0, 8, 0)
+            lw.addWidget(self.apps)
+            v.addLayout(lw, 1)
+        else:
+            self.apps = None
+            ap = QtWidgets.QLabel("Input")
+            ap.setObjectName("hint")
+            ap.setContentsMargins(10, 0, 0, 0)
+            v.addWidget(ap)
+            hint = QtWidgets.QLabel("Your microphone.\nChoose the device\nin Master.")
+            hint.setObjectName("hint")
+            hint.setAlignment(Qt.AlignCenter)
+            lw = QtWidgets.QHBoxLayout()
+            lw.setContentsMargins(8, 0, 8, 0)
+            lw.addWidget(hint)
+            v.addLayout(lw, 1)
 
         self.set_default(False)
-        self._gains()
-        self.restart()
+        self._refresh()
 
-    # -- state --------------------------------------------------------------
+    # ---- state -----------------------------------------------------------
+    def _refresh(self):
+        c = self.ch
+        self.title.setText(f"{c['icon']}  {c['name'].upper()}")
+        for i in (0, 1):
+            self.mute[i].setText("🔇" if self.mute[i].isChecked() else "🔊")
+            self.icon[i].setEnabled(self.dot[i].isChecked())
+            self.audio.on[i] = self.dot[i].isChecked()
+            self.audio.gain[i] = vol_curve(self.sl[i].value())
+            self.audio.mute[i] = self.mute[i].isChecked()
+
     def set_default(self, is_default):
-        self.setProperty("isDefault", is_default)
-        self.default_btn.setProperty("isDefault", is_default)
-        self.default_btn.setText("★  Windows default output" if is_default else "☆  Make Windows default output")
-        self.default_btn.setToolTip("Everything on your PC plays through this channel unless you move it."
-                                    if is_default else "Click to make this the channel Windows plays through.")
-        repolish(self)
-        repolish(self.default_btn)
+        self.is_default = is_default
+        self._info()
 
-    def set_output(self, i, name):
-        j = self.out_cb[i].findData(name)
-        if j >= 0:
-            self.out_cb[i].setCurrentIndex(j)
+    def _info(self):
+        if self.note_text:
+            self.info.setStyleSheet("color:#ff8a7a; font-size:11px;")
+            self.info.setText(self.note_text)
+        elif self.is_default:
+            self.info.setStyleSheet("color:#e0b341; font-size:10px; font-weight:700;")
+            self.info.setText("★ WINDOWS DEFAULT")
+        else:
+            self.info.setText("")
 
     def _cfg(self):
         c = self.ch
-        c["name"] = self.name.text() or "Channel"
-        c["render"] = self.cable_cb.currentData() or ""
-        c["capture"] = capture_of(c["render"]) if c["render"] else ""
-        c["out"] = [cb.currentData() or "" for cb in self.out_cb]
-        c["vol"] = self.master.value()
-        c["ov"] = [s.value() for s in self.out_sl]
-        c["mute"] = [m.isChecked() for m in self.out_mute]
+        c["on"] = [d.isChecked() for d in self.dot]
+        c["vol"] = [s.value() for s in self.sl]
+        c["mute"] = [m.isChecked() for m in self.mute]
         self.changed.emit()
 
     def _gains(self, *_):
-        self.engine.master = vol_curve(self.master.value())
-        self.master_lbl.setText(f"{self.master.value()}%")
-        for i in (0, 1):
-            self.engine.gain[i] = vol_curve(self.out_sl[i].value())
-            self.engine.mute[i] = self.out_mute[i].isChecked()
+        self._refresh()
         self._cfg()
 
-    def _cable_changed(self, *_):
-        new = self.cable_cb.currentData() or ""
-        owner = self.taken_fn(new, self.ch["id"]) if new else None
-        if owner:
-            self.cable_cb.blockSignals(True)
-            self.cable_cb.setCurrentIndex(max(self.cable_cb.findData(self.ch["render"] or ""), 0))
-            self.cable_cb.blockSignals(False)
-            self.status.setText(f"That cable is already used by '{owner}'.")
-            return
-        self._dev_changed()
+    def _dot(self, i, on):
+        if not on:
+            self.audio.rings[i].clear()
+        self._gains()
 
-    def _dev_changed(self, *_):
-        self._cfg()
-        self.restart()
+    def set_note(self, text):
+        self.note_text = text.replace("\n", " ")
+        self._info()
 
-    def restart(self):
-        self.engine.stop()
+    def restart(self, mic_name=""):
+        self.audio.stop()
         c = self.ch
-        if not c["render"]:
-            self.status.setText("Choose a virtual cable for this channel.")
-            return
-        if not any(c["out"]):
-            self.status.setText("Choose at least one output.")
-            return
-        idx_in = self.ins.get(c["capture"])
-        if idx_in is None:
-            self.status.setText("Cable's recording side not found. Try 'Rescan devices'.")
-            return
-        idx_out = [self.outs.get(o) if o else None for o in c["out"]]
-        err = self.engine.start(idx_in, idx_out)
-        self.status.setText(f"Audio error: {err}" if err else "")
-
-    def tick(self):
-        self.lvl = max(self.engine.level, self.lvl * 0.85)
-        self.engine.level = 0.0
-        self.meter.setValue(int(min(1.0, self.lvl) * 100))
+        if c["type"] == "mic":
+            if not mic_name:
+                self.set_note("Choose a mic\nin Master")
+                return
+            idx = self.ins.get(mic_name)
+            if idx is None:
+                self.set_note("Mic not found.\nTry Rescan.")
+                return
+        else:
+            if not c["render"]:
+                self.set_note("No virtual cable.\nUse ⚙ to pick one.")
+                return
+            idx = self.ins.get(capture_of(c["render"]))
+            if idx is None:
+                self.set_note("Cable not found.\nTry Rescan.")
+                return
+        err = self.audio.start(idx)
+        self.set_note(f"Audio error:\n{err}" if err else "")
 
     def shutdown(self):
-        self.engine.stop()
+        self.audio.stop()
+
+    # ---- ⚙ menu ------------------------------------------------------------
+    def _gear(self):
+        c = self.ch
+        m = QtWidgets.QMenu(self)
+        rename = m.addAction("Rename...")
+        cable_actions = {}
+        if c["type"] == "cable":
+            sub = m.addMenu("Virtual cable")
+            none = sub.addAction("(none)")
+            none.setCheckable(True)
+            none.setChecked(not c["render"])
+            cable_actions[none] = ""
+            for cab in self.cables:
+                owner = self.taken_fn(cab, c["id"])
+                a = sub.addAction(cable_label(cab) + (f"  (used by {owner})" if owner else ""))
+                a.setCheckable(True)
+                a.setChecked(cab == c["render"])
+                a.setEnabled(not owner)
+                cable_actions[a] = cab
+            if not self.cables:
+                sub.addAction("No cables found").setEnabled(False)
+        m.addSeparator()
+        remove = m.addAction("Remove channel")
+        remove.setEnabled(self.can_remove)
+        act = m.exec(QtGui.QCursor.pos())
+        if act is None:
+            return
+        if act == rename:
+            text, ok = QtWidgets.QInputDialog.getText(self, "Rename channel", "Name:", text=c["name"])
+            if ok and text.strip():
+                c["name"] = text.strip()
+                self._refresh()
+                self.changed.emit()
+        elif act == remove:
+            self.removeRequested.emit(c["id"])
+        elif act in cable_actions:
+            c["render"] = cable_actions[act]
+            c["capture"] = capture_of(c["render"]) if c["render"] else ""
+            self.restart()
+            self.changed.emit()
 
 
 class Main(QtWidgets.QWidget):
@@ -720,84 +820,33 @@ class Main(QtWidgets.QWidget):
         super().__init__()
         self.setObjectName("root")
         self.setWindowTitle(f"{APP_NAME}  v{VERSION}")
-        self.resize(1250, 800)
+        self.resize(1280, 700)
         self.cfg = self.load()
         self.router = Router()
         self.active, self.applied, self._sig = {}, set(), None
         self.cards = {}
+        self.buses = [Bus(0), Bus(1)]
         self._default_applied = None
         self.up_state, self.up_info, self.up_path = "idle", None, None
 
-        root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 8)
-        root.setSpacing(8)
-
-        # ---- header bar
-        header = QtWidgets.QFrame()
-        header.setObjectName("header")
-        h = QtWidgets.QHBoxLayout(header)
-        h.setContentsMargins(18, 12, 18, 12)
-        title = QtWidgets.QLabel(APP_NAME)
-        title.setObjectName("appTitle")
-        ver = QtWidgets.QLabel(f"v{VERSION}")
-        ver.setObjectName("hint")
-        h.addWidget(title)
-        h.addWidget(ver)
-        h.addStretch()
-        self.up_lbl = QtWidgets.QLabel("")
-        self.up_lbl.setObjectName("hint")
-        self.up_btn = QtWidgets.QPushButton("Check for updates")
-        self.up_btn.clicked.connect(self.on_update_click)
-        rescan = QtWidgets.QPushButton("Rescan devices")
-        rescan.clicked.connect(lambda: self.rebuild(rescan=True))
-        add = QtWidgets.QPushButton("+ Add channel")
-        add.setObjectName("primary")
-        add.clicked.connect(self.add_channel)
-        for w in (self.up_lbl, self.up_btn, rescan, add):
-            h.addWidget(w)
-        root.addWidget(header)
-
-        self.up_bar = QtWidgets.QProgressBar()
-        self.up_bar.setObjectName("updateBar")
-        self.up_bar.setRange(0, 100)
-        self.up_bar.setFixedHeight(5)
-        self.up_bar.setTextVisible(False)
-        self.up_bar.hide()
-        root.addWidget(self.up_bar)
-
-        # ---- body
-        self.banner = QtWidgets.QLabel()
-        self.banner.setObjectName("banner")
-        self.banner.setWordWrap(True)
-        self.banner.setOpenExternalLinks(True)
-        self.banner.hide()
-        bw = QtWidgets.QHBoxLayout()
-        bw.setContentsMargins(18, 0, 18, 0)
-        bw.addWidget(self.banner)
-        root.addLayout(bw)
+        outer = QtWidgets.QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self.build_master())
 
         self.scroll = QtWidgets.QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.holder = QtWidgets.QWidget()
         self.row = QtWidgets.QHBoxLayout(self.holder)
-        self.row.setContentsMargins(18, 4, 18, 4)
-        self.row.setSpacing(14)
+        self.row.setContentsMargins(0, 0, 0, 0)
+        self.row.setSpacing(0)
         self.row.setAlignment(Qt.AlignLeft)
         self.scroll.setWidget(self.holder)
-        root.addWidget(self.scroll, 1)
+        outer.addWidget(self.scroll, 1)
 
-        foot = QtWidgets.QLabel(
-            "★ Windows plays everything through the default channel. Drag an app between channels to route just "
-            "that app. Each channel plays to two outputs at once.")
-        foot.setObjectName("footer")
-        foot.setWordWrap(True)
-        fw = QtWidgets.QHBoxLayout()
-        fw.setContentsMargins(18, 0, 18, 0)
-        fw.addWidget(foot)
-        root.addLayout(fw)
-
-        # ---- go
         self.record_original_default()
+        self.scan()
+        self.populate_master()
         self.rebuild()
 
         self.up = Updater()
@@ -813,19 +862,169 @@ class Main(QtWidgets.QWidget):
         t.timeout.connect(self.poll)
         t.start(2000)
         m = QtCore.QTimer(self)
-        m.timeout.connect(lambda: [c.tick() for c in self.cards.values()])
+        m.timeout.connect(self.tick_meters)
         m.start(40)
         self.poll()
 
-    # ---- persistence ------------------------------------------------------
+    # ---- master panel ---------------------------------------------------------
+    def build_master(self):
+        mp = QtWidgets.QFrame()
+        mp.setObjectName("master")
+        mp.setFixedWidth(270)
+        v = QtWidgets.QVBoxLayout(mp)
+        v.setContentsMargins(16, 16, 16, 14)
+        v.setSpacing(6)
+
+        t = QtWidgets.QLabel("🎚  MASTER")
+        t.setObjectName("masterTitle")
+        v.addWidget(t)
+        nm = QtWidgets.QLabel(f"{APP_NAME}  ·  v{VERSION}")
+        nm.setObjectName("appName")
+        v.addWidget(nm)
+        v.addSpacing(10)
+
+        v.addWidget(caption("Devices"))
+        self.dev = {}
+        for key, label, ph in (("personal", "🎧  Personal Mix", "Select Personal Mix"),
+                               ("stream", "📡  Stream Mix", "Select Stream Mix (optional)"),
+                               ("mic", "🎤  Mic Input", "Select Mic Input")):
+            lbl = QtWidgets.QLabel(label)
+            lbl.setObjectName("hint")
+            v.addWidget(lbl)
+            cb = new_combo()
+            cb.currentIndexChanged.connect(self.on_master_changed)
+            v.addWidget(cb)
+            entry = {"cb": cb, "ph": ph}
+            if key in ("personal", "stream"):
+                r = QtWidgets.QHBoxLayout()
+                sl = QtWidgets.QSlider(Qt.Horizontal)
+                sl.setRange(0, 100)
+                sl.setValue(self.cfg["pvol" if key == "personal" else "svol"])
+                sl.valueChanged.connect(self.on_master_changed)
+                pct = QtWidgets.QLabel()
+                pct.setMinimumWidth(36)
+                pct.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                r.addWidget(sl, 1)
+                r.addWidget(pct)
+                v.addLayout(r)
+                meter = QtWidgets.QProgressBar()
+                meter.setRange(0, 100)
+                meter.setTextVisible(False)
+                meter.setFixedHeight(4)
+                v.addWidget(meter)
+                entry.update(sl=sl, pct=pct, meter=meter, lvl=0.0)
+            err = QtWidgets.QLabel("")
+            err.setObjectName("err")
+            err.setWordWrap(True)
+            err.hide()
+            v.addWidget(err)
+            entry["err"] = err
+            self.dev[key] = entry
+            v.addSpacing(6)
+
+        v.addWidget(caption("Windows output"))
+        hint = QtWidgets.QLabel("Everything on your PC plays through this channel unless you move it.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+        self.dflt_cb = new_combo()
+        self.dflt_cb.currentIndexChanged.connect(self.on_default_picked)
+        v.addWidget(self.dflt_cb)
+
+        v.addStretch(1)
+        self.banner = QtWidgets.QLabel()
+        self.banner.setObjectName("banner")
+        self.banner.setWordWrap(True)
+        self.banner.setOpenExternalLinks(True)
+        self.banner.hide()
+        v.addWidget(self.banner)
+
+        rescan = QtWidgets.QPushButton("Rescan devices")
+        rescan.clicked.connect(lambda: self.rebuild(rescan=True))
+        v.addWidget(rescan)
+        self.up_btn = QtWidgets.QPushButton("Check for updates")
+        self.up_btn.clicked.connect(self.on_update_click)
+        v.addWidget(self.up_btn)
+        self.up_bar = QtWidgets.QProgressBar()
+        self.up_bar.setObjectName("updateBar")
+        self.up_bar.setRange(0, 100)
+        self.up_bar.setFixedHeight(5)
+        self.up_bar.setTextVisible(False)
+        self.up_bar.hide()
+        v.addWidget(self.up_bar)
+        self.up_lbl = QtWidgets.QLabel("")
+        self.up_lbl.setObjectName("hint")
+        self.up_lbl.setWordWrap(True)
+        v.addWidget(self.up_lbl)
+        return mp
+
+    def scan(self):
+        self.ins, self.outs = wasapi_devices()
+        self.cables = find_cables(self.ins, self.outs)
+        self.real_outs = [n for n in self.outs if n not in self.cables and not is_virtual(n)]
+        self.real_ins = [n for n in self.ins if not is_virtual(n)]
+
+    def populate_master(self):
+        for key, lst in (("personal", self.real_outs), ("stream", self.real_outs), ("mic", self.real_ins)):
+            e = self.dev[key]
+            fill_combo(e["cb"], [(n, n) for n in lst], self.cfg[key], e["ph"])
+        self.update_master_labels()
+
+    def update_master_labels(self):
+        for key, vk in (("personal", "pvol"), ("stream", "svol")):
+            e = self.dev[key]
+            e["pct"].setText(f"{e['sl'].value()}%")
+        pc = self.dev["personal"]["cb"]
+        pc.setProperty("needs", not self.cfg["personal"])
+        repolish(pc)
+
+    def on_master_changed(self, *_):
+        for key in ("personal", "stream", "mic"):
+            self.cfg[key] = self.dev[key]["cb"].currentData() or ""
+        self.cfg["pvol"] = self.dev["personal"]["sl"].value()
+        self.cfg["svol"] = self.dev["stream"]["sl"].value()
+        self.save()
+        self.update_master_labels()
+        self.start_buses()
+        for c in self.cards.values():
+            if c.ch["type"] == "mic":
+                c.restart(self.cfg["mic"])
+        self.apply_default()
+
+    def start_buses(self):
+        for i, key in enumerate(("personal", "stream")):
+            b = self.buses[i]
+            b.channels = [c.audio for c in self.cards.values()]
+            b.master = vol_curve(self.dev[key]["sl"].value())
+            name = self.cfg[key]
+            idx = self.outs.get(name) if name else None
+            err = b.start(idx) if (name and idx is not None) else None
+            if name and idx is None:
+                err = "Device not found. Try Rescan."
+            e = self.dev[key]["err"]
+            e.setText(f"Audio error: {err}" if err else "")
+            e.setVisible(bool(err))
+
+    def tick_meters(self):
+        for i, key in enumerate(("personal", "stream")):
+            e = self.dev[key]
+            e["lvl"] = max(self.buses[i].level, e["lvl"] * 0.85)
+            self.buses[i].level = 0.0
+            e["meter"].setValue(int(min(1.0, e["lvl"]) * 100))
+
+    # ---- persistence ------------------------------------------------------------
     def load(self):
+        old = {}
         try:
-            cfg = json.loads(CFG_PATH.read_text())
-            cfg.setdefault("assign", {})
-            return cfg
+            old = json.loads(CFG_PATH.read_text())
+            if old.get("schema") == SCHEMA:
+                return old
         except Exception:
-            return {"channels": [self.new_channel(n) for n in ("Media", "Game", "Chat")],
-                    "assign": {}, "default": "", "orig_default": ""}
+            pass
+        return {"schema": SCHEMA, "assign": {}, "default": "",
+                "orig_default": old.get("orig_default", ""),
+                "personal": "", "stream": "", "mic": "", "pvol": 100, "svol": 100,
+                "channels": [self.new_channel(n, i, c, k) for n, i, c, k in DEFAULT_CHANNELS]}
 
     def save(self):
         try:
@@ -835,14 +1034,18 @@ class Main(QtWidgets.QWidget):
             pass
 
     @staticmethod
-    def new_channel(name):
-        return {"id": uuid.uuid4().hex[:8], "name": name, "render": "", "capture": "",
-                "out": ["", ""], "vol": 100, "ov": [100, 100], "mute": [False, False]}
+    def new_channel(name, icon, color, kind="cable"):
+        return {"id": uuid.uuid4().hex[:8], "name": name, "icon": icon, "color": color, "type": kind,
+                "render": "", "capture": "", "vol": [100, 100],
+                "on": [True, True] if kind == "cable" else [False, True], "mute": [False, False]}
 
     def channel(self, cid):
         return next((c for c in self.cfg["channels"] if c["id"] == cid), None)
 
-    # ---- Windows default output --------------------------------------------
+    def cable_channels(self):
+        return [c for c in self.cfg["channels"] if c["type"] == "cable"]
+
+    # ---- Windows default output ---------------------------------------------------
     def record_original_default(self):
         name = default_output_name()
         if name and not is_virtual(name):
@@ -854,16 +1057,16 @@ class Main(QtWidgets.QWidget):
 
     def apply_default(self):
         ch = self.default_channel()
-        # never hijack Windows' output until the channel actually has somewhere to play
-        if ch and ch["render"] and any(ch["out"]) and ch["render"] != self._default_applied:
+        # don't hijack Windows' output until the mixer has somewhere to send it
+        if ch and ch["render"] and (self.cfg["personal"] or self.cfg["stream"]) \
+                and ch["render"] != self._default_applied:
             self._default_applied = ch["render"]
             self.router.async_(self.router.set_default, ch["render"])
 
-    def set_default(self, cid):
+    def on_default_picked(self, *_):
+        cid = self.dflt_cb.currentData()
         ch = self.channel(cid)
         if not ch or not ch["render"]:
-            if cid in self.cards:
-                self.cards[cid].status.setText("Choose a virtual cable first.")
             return
         self.cfg["default"] = cid
         self._default_applied = None
@@ -876,7 +1079,9 @@ class Main(QtWidgets.QWidget):
     def refresh_default_badges(self):
         d = self.cfg.get("default")
         for cid, card in self.cards.items():
-            card.set_default(cid == d)
+            card.set_default(cid == d and card.ch["type"] == "cable")
+        fill_combo(self.dflt_cb, [(c["name"], c["id"]) for c in self.cable_channels() if c["render"]],
+                   d, "- none -")
 
     def restore_windows_output(self):
         """On exit: put Windows (and routed apps) back on the user's real output."""
@@ -889,19 +1094,23 @@ class Main(QtWidgets.QWidget):
         for j in jobs:
             j.join(timeout=6)
 
-    # ---- channels ------------------------------------------------------------
-    def auto_setup(self, cables, real_outs):
+    # ---- channels -----------------------------------------------------------------------
+    def auto_setup(self):
         used = {c["render"] for c in self.cfg["channels"] if c["render"]}
-        free = [c for c in cables if c not in used]
-        orig = self.cfg.get("orig_default", "")
-        for ch in self.cfg["channels"]:
+        free = [c for c in self.cables if c not in used]
+        for ch in self.cable_channels():
             if not ch["render"] and free:
                 ch["render"] = free.pop(0)
                 ch["capture"] = capture_of(ch["render"])
-            if not any(ch["out"]) and orig in real_outs:
-                ch["out"][0] = orig  # sensible start: play to your normal output
-        if not self.channel(self.cfg.get("default")) and self.cfg["channels"]:
-            self.cfg["default"] = self.cfg["channels"][0]["id"]
+        orig = self.cfg.get("orig_default", "")
+        if not self.cfg["personal"] and orig in self.real_outs:
+            self.cfg["personal"] = orig  # sensible start: play to your normal output
+            fill_combo(self.dev["personal"]["cb"], [(n, n) for n in self.real_outs], orig,
+                       self.dev["personal"]["ph"])
+            self.update_master_labels()
+        cc = self.cable_channels()
+        if not self.channel(self.cfg.get("default")) or self.channel(self.cfg["default"])["type"] != "cable":
+            self.cfg["default"] = cc[0]["id"] if cc else ""
         self.save()
 
     def taken_by(self, cable, my_id):
@@ -911,6 +1120,8 @@ class Main(QtWidgets.QWidget):
         return None
 
     def rebuild(self, rescan=False):
+        for b in self.buses:
+            b.stop()
         for c in self.cards.values():
             c.shutdown()
         if rescan:
@@ -919,6 +1130,8 @@ class Main(QtWidgets.QWidget):
                 sd._initialize()
             except Exception:
                 pass
+            self.scan()
+            self.populate_master()
         for c in self.cards.values():
             c.setParent(None)
         while self.row.count():
@@ -927,35 +1140,43 @@ class Main(QtWidgets.QWidget):
                 it.widget().setParent(None)
         self.cards = {}
 
-        ins, outs = wasapi_devices()
-        cables = find_cables(ins, outs)
-        real_outs = [n for n in outs if n not in cables and not is_virtual(n)]
-        self.auto_setup(cables, real_outs)
-
+        self.auto_setup()
         n = len(self.cfg["channels"])
         for ch in self.cfg["channels"]:
-            card = ChannelCard(ch, cables, ins, outs, self.taken_by, can_remove=n > 1)
-            card.changed.connect(self.save)
-            card.changed.connect(self.apply_default)
-            card.removeRequested.connect(self.remove_channel)
-            card.defaultRequested.connect(self.set_default)
-            card.apps.dropped.connect(self.on_drop)
-            self.cards[ch["id"]] = card
-            self.row.addWidget(card)
+            w = ChannelWidget(ch, self.cables, self.ins, self.taken_by, can_remove=n > 1)
+            w.changed.connect(self.save)
+            w.changed.connect(self.apply_default)
+            w.changed.connect(self.refresh_default_badges)
+            w.removeRequested.connect(self.remove_channel)
+            if w.apps is not None:
+                w.apps.dropped.connect(self.on_drop)
+            self.cards[ch["id"]] = w
+            self.row.addWidget(w)
+        add = QtWidgets.QPushButton("+\nAdd\nchannel")
+        add.setObjectName("addCh")
+        add.setFixedWidth(64)
+        add.setMinimumHeight(160)
+        add.clicked.connect(self.add_channel)
+        self.row.addWidget(add, 0, Qt.AlignTop)
+        self.row.setContentsMargins(0, 0, 10, 0)
+
+        self.start_buses()
+        for w in self.cards.values():
+            w.restart(self.cfg["mic"])
         self.refresh_default_badges()
 
         msgs = []
         if not self.router.exe:
-            msgs.append("SoundVolumeView.exe was not found, so routing apps and setting the Windows default "
-                        "will not work.")
-        if not cables:
+            msgs.append("SoundVolumeView.exe not found: routing apps and the Windows default won't work.")
+        need = len(self.cable_channels())
+        if not self.cables:
             msgs.append('No virtual cables found. Install VB-Cable from '
                         '<a style="color:#ffd479" href="https://vb-audio.com/Cable/">vb-audio.com/Cable</a>, '
-                        'restart your PC, then click "Rescan devices".')
-        elif len(cables) < n:
-            msgs.append(f"You have {len(cables)} virtual cable(s) but {n} channels. Each channel needs its own "
-                        "cable (VB-Cable A+B / C+D packs add more), or remove a channel.")
-        self.banner.setText("<br>".join(msgs))
+                        'restart your PC, then click Rescan.')
+        elif len(self.cables) < need:
+            msgs.append(f"{len(self.cables)} virtual cable(s) for {need} channels. Each channel needs its own "
+                        "cable (VB-Cable A+B / C+D packs add more).")
+        self.banner.setText("<br><br>".join(msgs))
         self.banner.setVisible(bool(msgs))
 
         self._default_applied = None
@@ -964,7 +1185,9 @@ class Main(QtWidgets.QWidget):
         self.refresh_lists()
 
     def add_channel(self):
-        self.cfg["channels"].append(self.new_channel(f"Channel {len(self.cfg['channels']) + 1}"))
+        k = len(self.cfg["channels"])
+        self.cfg["channels"].append(
+            self.new_channel(f"Channel {k + 1}", "🔊", EXTRA_COLORS[k % len(EXTRA_COLORS)], "cable"))
         self.save()
         self.rebuild()
 
@@ -973,8 +1196,10 @@ class Main(QtWidgets.QWidget):
             return
         self.cfg["channels"] = [c for c in self.cfg["channels"] if c["id"] != cid]
         if self.cfg.get("default") == cid:
-            self.cfg["default"] = self.cfg["channels"][0]["id"]
+            self.cfg["default"] = ""
             self._default_applied = None
+        self.save()
+        self.auto_setup()
         dflt = self.default_channel()
         for proc, c in list(self.cfg["assign"].items()):
             if c == cid:
@@ -984,13 +1209,13 @@ class Main(QtWidgets.QWidget):
         self.save()
         self.rebuild()
 
-    # ---- drag & drop / app routing ---------------------------------------------
+    # ---- drag & drop / app routing -----------------------------------------------------------
     def on_drop(self, cid, proc):
         ch = self.channel(cid)
-        if not ch:
+        if not ch or ch["type"] != "cable":
             return
         if not ch["render"]:
-            self.cards[cid].status.setText("Choose a virtual cable first.")
+            self.cards[cid].set_note("Pick a cable first\n(use ⚙)")
             return
         self.cfg["assign"][proc] = cid
         self.applied = {k for k in self.applied if k[0] != proc}
@@ -1021,7 +1246,7 @@ class Main(QtWidgets.QWidget):
         if QtWidgets.QApplication.mouseButtons() & Qt.LeftButton:
             return  # never rebuild lists in the middle of a drag
         dflt = self.cfg.get("default")
-        groups = {c["id"]: [] for c in self.cfg["channels"]}
+        groups = {c["id"]: [] for c in self.cable_channels()}
         for proc in sorted(set(self.active) | set(self.cfg["assign"]), key=str.lower):
             cid = self.cfg["assign"].get(proc)
             if cid not in groups:
@@ -1029,7 +1254,7 @@ class Main(QtWidgets.QWidget):
                 cid = dflt
             if cid not in groups:
                 continue
-            if proc not in self.active and cid == dflt and proc not in self.cfg["assign"]:
+            if proc not in self.active and proc not in self.cfg["assign"]:
                 continue
             groups[cid].append(proc)
         sig = (tuple((k, tuple(v)) for k, v in groups.items()), tuple(sorted(self.active)))
@@ -1038,16 +1263,18 @@ class Main(QtWidgets.QWidget):
         self._sig = sig
         for cid, procs in groups.items():
             w = self.cards[cid].apps
+            if w is None:
+                continue
             w.clear()
             for p in procs:
                 idle = p not in self.active
-                it = QtWidgets.QListWidgetItem(p.replace(".exe", "") + ("   (idle)" if idle else ""))
+                it = QtWidgets.QListWidgetItem(p.replace(".exe", "") + ("  (idle)" if idle else ""))
                 it.setData(Qt.UserRole, p)
                 if idle:
                     it.setForeground(QtGui.QColor("#8b93a5"))
                 w.addItem(it)
 
-    # ---- updates -----------------------------------------------------------------
+    # ---- updates ---------------------------------------------------------------------------------
     def on_update_click(self):
         if self.up_state == "available":
             self.up_state = "downloading"
@@ -1098,6 +1325,8 @@ class Main(QtWidgets.QWidget):
         QtWidgets.QApplication.quit()
 
     def closeEvent(self, e):
+        for b in self.buses:
+            b.stop()
         for c in self.cards.values():
             c.shutdown()
         self.save()
