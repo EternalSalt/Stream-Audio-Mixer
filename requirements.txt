@@ -1,6 +1,3 @@
 PySide6
 sounddevice
 numpy
-psutil
-pycaw
-comtypes

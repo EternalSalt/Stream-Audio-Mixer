@@ -20,19 +20,13 @@ import time
 import traceback
 import urllib.request
 import uuid
-from ctypes import POINTER, cast
 from pathlib import Path
 
 import numpy as np
-import psutil
 import sounddevice as sd
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
-import comtypes
-from comtypes import CLSCTX_ALL
-from pycaw.constants import CLSID_MMDeviceEnumerator
-from pycaw.pycaw import IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator
 
 APP_NAME = "Salty's Stream Mixer"
 APP_ID = "SaltysStreamMixer"
@@ -255,8 +249,11 @@ def cable_label(render_name):
 
 
 # --------------------------------------------------------------------------
-# Windows routing via NirSoft SoundVolumeView
+# Windows routing + app list via NirSoft SoundVolumeView (no COM in Python)
 # --------------------------------------------------------------------------
+SKIP_APPS = {"soundvolumeview.exe", Path(sys.executable).name.lower()}
+
+
 class Router:
     def __init__(self):
         self.exe = None
@@ -267,6 +264,7 @@ class Router:
         self.exe = self.exe or shutil.which("SoundVolumeView.exe")
         self.ids = {}
         self.defaults = set()
+        self.apps = {}
         self.lock = threading.Lock()
 
     def _run(self, *args):
@@ -278,7 +276,7 @@ class Router:
         try:
             self._run("/scomma", tmp)
             with open(tmp, newline="", encoding="utf-8-sig", errors="replace") as f:
-                ids, defaults = {}, set()
+                ids, defaults, apps = {}, set(), {}
                 for row in csv.DictReader(f):
                     if row.get("Type") == "Device" and row.get("Direction") == "Render":
                         key = next((k for k in row if "Friendly ID" in k), None)
@@ -286,7 +284,16 @@ class Router:
                             ids[row["Name"]] = row[key]
                         if (row.get("Default") or "").strip():
                             defaults.add(row["Name"])
-                self.ids, self.defaults = ids, defaults
+                    elif row.get("Type") == "Application" and row.get("Direction") == "Render":
+                        path = (row.get("Process Path") or "").strip()
+                        name = path.replace("/", "\\").split("\\")[-1] if path else ""
+                        if name and name.lower() not in SKIP_APPS:
+                            try:
+                                pid = int(row.get("Process ID") or 0)
+                            except ValueError:
+                                pid = 0
+                            apps.setdefault(name, set()).add(pid)
+                self.ids, self.defaults, self.apps = ids, defaults, apps
         except Exception:
             pass
         finally:
@@ -335,33 +342,6 @@ class Router:
         t = threading.Thread(target=fn, args=a, daemon=True)
         t.start()
         return t
-
-
-def list_audio_apps():
-    """{process_name: {pids}} for every audio session on every active render device."""
-    found = {}
-    me = os.getpid()
-    enum = comtypes.CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator,
-                                     comtypes.CLSCTX_INPROC_SERVER)
-    coll = enum.EnumAudioEndpoints(0, 1)  # eRender, DEVICE_STATE_ACTIVE
-    for i in range(coll.GetCount()):
-        try:
-            dev = coll.Item(i)
-            iface = dev.Activate(IAudioSessionManager2._iid_, CLSCTX_ALL, None)
-            mgr = cast(iface, POINTER(IAudioSessionManager2))
-            se = mgr.GetSessionEnumerator()
-            for j in range(se.GetCount()):
-                ctl = se.GetSession(j).QueryInterface(IAudioSessionControl2)
-                pid = ctl.GetProcessId()
-                if not pid or pid == me:
-                    continue
-                try:
-                    found.setdefault(psutil.Process(pid).name(), set()).add(pid)
-                except Exception:
-                    pass
-        except Exception:
-            continue
-    return found
 
 
 # --------------------------------------------------------------------------
@@ -958,14 +938,17 @@ class Main(QtWidgets.QWidget):
         self._default_ok = None
         self.apply_default(force=True)
 
-    def _check_default(self):
+    def _bg_scan(self):
+        """Background: ask SoundVolumeView what's playing and what Windows' default output is."""
         try:
+            with self.router.lock:
+                self.router.refresh()
             ch = self.default_channel()
-            names = self.router.default_render_names() if (ch and ch["render"]) else set()
+            names = set(self.router.defaults)
             base = ch["render"].split(" (")[0].strip() if ch and ch["render"] else ""
-            self._default_ok = (base in names) if names else None
+            self._default_ok = (base in names) if (names and base) else None
         except Exception as e:  # noqa
-            log(f"default check failed: {e}")
+            log(f"scan failed: {e}")
         finally:
             self._checking = False
 
@@ -1347,16 +1330,12 @@ class Main(QtWidgets.QWidget):
 
     def poll(self):
         try:
-            self.active = list_audio_apps()
-        except Exception:
-            self.active = {}
-        try:
+            self.active = dict(self.router.apps)
             self.apply_assignments()
             self.refresh_lists()
-            self._tick += 1
-            if self._tick % 2 == 1 and not self._checking:
+            if self.router.exe and not self._checking:
                 self._checking = True
-                self.router.async_(self._check_default)
+                self.router.async_(self._bg_scan)
             self.update_default_bar()
         except Exception:
             log("poll error:\n" + traceback.format_exc())
