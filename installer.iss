@@ -3,27 +3,27 @@
 #endif
 
 [Setup]
-AppId={{6C1E5D0A-3B7F-4E55-9A41-5A0C0F2B7D11}
-AppName=SonarLite
+AppId={{B7D2F4E1-8C3A-4F6B-9E21-5D7A0C4E9A30}
+AppName=Salty's Stream Mixer
 AppVersion={#AppVersion}
-DefaultDirName={autopf}\SonarLite
-DefaultGroupName=SonarLite
+DefaultDirName={autopf}\SaltysStreamMixer
+DefaultGroupName=Salty's Stream Mixer
 PrivilegesRequired=lowest
 OutputDir=dist
-OutputBaseFilename=SonarLite-Setup
+OutputBaseFilename=SaltysStreamMixer-Setup
 Compression=lzma2
 SolidCompression=yes
-UninstallDisplayIcon={app}\SonarLite.exe
+UninstallDisplayIcon={app}\SaltysStreamMixer.exe
 
 [Files]
-Source: "dist\SonarLite.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\SaltysStreamMixer.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\SonarLite"; Filename: "{app}\SonarLite.exe"
-Name: "{autodesktop}\SonarLite"; Filename: "{app}\SonarLite.exe"; Tasks: desktopicon
+Name: "{group}\Salty's Stream Mixer"; Filename: "{app}\SaltysStreamMixer.exe"
+Name: "{autodesktop}\Salty's Stream Mixer"; Filename: "{app}\SaltysStreamMixer.exe"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"
 
 [Run]
-Filename: "{app}\SonarLite.exe"; Description: "Launch SonarLite"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\SaltysStreamMixer.exe"; Description: "Launch Salty's Stream Mixer"; Flags: nowait postinstall skipifsilent
