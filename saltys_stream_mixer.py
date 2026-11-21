@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import urllib.request
 import uuid
@@ -45,6 +46,18 @@ TARGET = int(SR * 0.04)
 
 APP_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_ID
 CFG_PATH = APP_DIR / "config.json"
+LOG_PATH = APP_DIR / "app.log"
+
+
+def log(msg):
+    """Breadcrumbs for diagnosing problems: %APPDATA%\\SaltysStreamMixer\\app.log"""
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%H:%M:%S ") + str(msg) + "\n")
+    except Exception:
+        pass
+
 FROZEN = bool(getattr(sys, "frozen", False))
 if FROZEN:
     HERE = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))  # bundled files
@@ -253,6 +266,7 @@ class Router:
                 break
         self.exe = self.exe or shutil.which("SoundVolumeView.exe")
         self.ids = {}
+        self.defaults = set()
         self.lock = threading.Lock()
 
     def _run(self, *args):
@@ -264,13 +278,15 @@ class Router:
         try:
             self._run("/scomma", tmp)
             with open(tmp, newline="", encoding="utf-8-sig", errors="replace") as f:
-                ids = {}
+                ids, defaults = {}, set()
                 for row in csv.DictReader(f):
                     if row.get("Type") == "Device" and row.get("Direction") == "Render":
                         key = next((k for k in row if "Friendly ID" in k), None)
                         if key:
                             ids[row["Name"]] = row[key]
-                self.ids = ids
+                        if (row.get("Default") or "").strip():
+                            defaults.add(row["Name"])
+                self.ids, self.defaults = ids, defaults
         except Exception:
             pass
         finally:
@@ -291,11 +307,29 @@ class Router:
 
     def set_app(self, sd_name, proc):
         if self.exe:
-            self._run("/SetAppDefault", self.resolve(sd_name), "all", proc)
+            try:
+                args = ("/SetAppDefault", self.resolve(sd_name), "all", proc)
+                r = self._run(*args)
+                log(f"SVV {args} rc={r.returncode} {r.stderr[:150]!r}")
+            except Exception as e:  # noqa
+                log(f"SVV set_app failed: {e}")
 
     def set_default(self, sd_name):
         if self.exe:
-            self._run("/SetDefault", self.resolve(sd_name), "all")
+            try:
+                args = ("/SetDefault", self.resolve(sd_name), "all")
+                r = self._run(*args)
+                log(f"SVV {args} rc={r.returncode} {r.stderr[:150]!r}")
+            except Exception as e:  # noqa
+                log(f"SVV set_default failed: {e}")
+
+    def default_render_names(self):
+        """Names of render devices Windows currently uses as default (empty = unknown)."""
+        if not self.exe:
+            return set()
+        with self.lock:
+            self.refresh()
+        return set(self.defaults)
 
     def async_(self, fn, *a):
         t = threading.Thread(target=fn, args=a, daemon=True)
@@ -448,6 +482,11 @@ QWidget#root { background:#1a1d24; }
 QLabel, QCheckBox { background:transparent; }
 QScrollArea, QScrollArea > QWidget > QWidget { background:transparent; border:none; }
 
+QFrame#defaultBar { background:#2b303a; border-bottom:1px solid #1a1d24; }
+QLabel#defaultIcon { background:#e5484d; font-size:20px; }
+QLabel#defaultText { font-size:12px; }
+QPushButton#linkBtn { background:transparent; border:none; padding:0; text-decoration:underline; font-size:13px; }
+QPushButton#linkBtn:hover { color:#9db2ff; }
 QFrame#master { background:#14171d; border-right:1px solid #262b34; }
 QLabel#masterTitle { font-size:20px; font-weight:800; color:#5b7cff; }
 QLabel#appName { color:#8b93a5; }
@@ -768,6 +807,7 @@ class ChannelWidget(QtWidgets.QFrame):
                 self.set_note("Cable not found.\nTry Rescan.")
                 return
         err = self.audio.start(idx)
+        log(f"channel {c['name']}: {'ERROR ' + str(err) if err else 'capture ok'}")
         self.set_note(f"Audio error:\n{err}" if err else "")
 
     def shutdown(self):
@@ -829,9 +869,16 @@ class Main(QtWidgets.QWidget):
         self._default_applied = None
         self.up_state, self.up_info, self.up_path = "idle", None, None
 
-        outer = QtWidgets.QHBoxLayout(self)
+        top = QtWidgets.QVBoxLayout(self)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(0)
+        self.default_bar = self.build_default_bar()
+        top.addWidget(self.default_bar)
+        self._default_ok, self._checking, self._tick = None, False, 0
+        outer = QtWidgets.QHBoxLayout()
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+        top.addLayout(outer, 1)
         outer.addWidget(self.build_master())
 
         self.scroll = QtWidgets.QScrollArea()
@@ -865,6 +912,62 @@ class Main(QtWidgets.QWidget):
         m.timeout.connect(self.tick_meters)
         m.start(40)
         self.poll()
+
+    # ---- "set Windows defaults" bar (like Sonar's) --------------------------------
+    def build_default_bar(self):
+        bar = QtWidgets.QFrame()
+        bar.setObjectName("defaultBar")
+        h = QtWidgets.QHBoxLayout(bar)
+        h.setContentsMargins(0, 0, 14, 0)
+        h.setSpacing(12)
+        icon = QtWidgets.QLabel("🔇")
+        icon.setObjectName("defaultIcon")
+        icon.setFixedSize(48, 44)
+        icon.setAlignment(Qt.AlignCenter)
+        self.bar_text = QtWidgets.QLabel()
+        self.bar_text.setObjectName("defaultText")
+        self.bar_btn = QtWidgets.QPushButton("Click to auto set defaults")
+        self.bar_btn.setObjectName("linkBtn")
+        self.bar_btn.setCursor(Qt.PointingHandCursor)
+        self.bar_btn.clicked.connect(self.force_default)
+        h.addWidget(icon)
+        h.addWidget(self.bar_text)
+        h.addWidget(self.bar_btn)
+        h.addStretch(1)
+        bar.hide()
+        return bar
+
+    def update_default_bar(self):
+        ch = self.default_channel()
+        text, link = "", False
+        if self.router.exe and ch is not None:
+            if not (self.cfg["personal"] or self.cfg["stream"]):
+                text = "Choose a Personal Mix device in Master, then Windows can use this mixer as its output."
+            elif not ch["render"]:
+                text = "The Windows default channel has no virtual cable. Use its ⚙ menu to pick one."
+            elif self._default_ok is False:
+                text = "Set Salty's Stream Mixer as your default audio output in your Windows sound settings."
+                link = True
+        self.bar_text.setText(text)
+        self.bar_btn.setVisible(link)
+        self.default_bar.setVisible(bool(text))
+
+    def force_default(self):
+        self.bar_text.setText("Setting Windows defaults...")
+        self.bar_btn.hide()
+        self._default_ok = None
+        self.apply_default(force=True)
+
+    def _check_default(self):
+        try:
+            ch = self.default_channel()
+            names = self.router.default_render_names() if (ch and ch["render"]) else set()
+            base = ch["render"].split(" (")[0].strip() if ch and ch["render"] else ""
+            self._default_ok = (base in names) if names else None
+        except Exception as e:  # noqa
+            log(f"default check failed: {e}")
+        finally:
+            self._checking = False
 
     # ---- master panel ---------------------------------------------------------
     def build_master(self):
@@ -999,6 +1102,8 @@ class Main(QtWidgets.QWidget):
             name = self.cfg[key]
             idx = self.outs.get(name) if name else None
             err = b.start(idx) if (name and idx is not None) else None
+            if name:
+                log(f"bus {key} -> {name!r}: {'ERROR ' + str(err) if err else 'ok'}")
             if name and idx is None:
                 err = "Device not found. Try Rescan."
             e = self.dev[key]["err"]
@@ -1055,12 +1160,13 @@ class Main(QtWidgets.QWidget):
     def default_channel(self):
         return self.channel(self.cfg.get("default"))
 
-    def apply_default(self):
+    def apply_default(self, force=False):
         ch = self.default_channel()
         # don't hijack Windows' output until the mixer has somewhere to send it
         if ch and ch["render"] and (self.cfg["personal"] or self.cfg["stream"]) \
-                and ch["render"] != self._default_applied:
+                and (force or ch["render"] != self._default_applied):
             self._default_applied = ch["render"]
+            log(f"setting Windows default output -> {ch['render']}")
             self.router.async_(self.router.set_default, ch["render"])
 
     def on_default_picked(self, *_):
@@ -1160,9 +1266,14 @@ class Main(QtWidgets.QWidget):
         self.row.addWidget(add, 0, Qt.AlignTop)
         self.row.setContentsMargins(0, 0, 10, 0)
 
-        self.start_buses()
-        for w in self.cards.values():
-            w.restart(self.cfg["mic"])
+        try:
+            self.start_buses()
+            for w in self.cards.values():
+                w.restart(self.cfg["mic"])
+        except Exception:
+            log("audio start error:\n" + traceback.format_exc())
+        log(f"rebuild: {len(self.cables)} cables, outs={self.real_outs}, ins={self.real_ins}, "
+            f"personal={self.cfg['personal']!r}, stream={self.cfg['stream']!r}, mic={self.cfg['mic']!r}")
         self.refresh_default_badges()
 
         msgs = []
@@ -1239,8 +1350,16 @@ class Main(QtWidgets.QWidget):
             self.active = list_audio_apps()
         except Exception:
             self.active = {}
-        self.apply_assignments()
-        self.refresh_lists()
+        try:
+            self.apply_assignments()
+            self.refresh_lists()
+            self._tick += 1
+            if self._tick % 2 == 1 and not self._checking:
+                self._checking = True
+                self.router.async_(self._check_default)
+            self.update_default_bar()
+        except Exception:
+            log("poll error:\n" + traceback.format_exc())
 
     def refresh_lists(self):
         if QtWidgets.QApplication.mouseButtons() & Qt.LeftButton:
@@ -1336,16 +1455,37 @@ class Main(QtWidgets.QWidget):
 
 def main():
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    log = open(APP_DIR / "crash.log", "a", buffering=1)
-    faulthandler.enable(file=log)
+    try:
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 400_000:
+            LOG_PATH.unlink()
+    except Exception:
+        pass
+    crash = open(APP_DIR / "crash.log", "a", buffering=1)
+    faulthandler.enable(file=crash)
+    log(f"=== start v{VERSION} frozen={FROZEN} ===")
+    shown = {"n": 0}
 
     def hook(et, ev, tb):
-        log.write("".join(traceback.format_exception(et, ev, tb)) + "\n")
+        txt = "".join(traceback.format_exception(et, ev, tb))
+        crash.write(txt + "\n")
+        log("EXCEPTION:\n" + txt)
+        if shown["n"] < 3:  # don't spam dialogs
+            shown["n"] += 1
+            try:
+                QtWidgets.QMessageBox.critical(
+                    None, APP_NAME, f"Something went wrong:\n\n{ev}\n\nDetails were saved to:\n{APP_DIR}")
+            except Exception:
+                pass
 
     sys.excepthook = hook
+    threading.excepthook = lambda a: log(f"THREAD EXCEPTION: {a.exc_type.__name__}: {a.exc_value}")
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(STYLE)
-    w = Main()
+    try:
+        w = Main()
+    except Exception:
+        hook(*sys.exc_info())
+        sys.exit(1)
     w.show()
     sys.exit(app.exec())
 

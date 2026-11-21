@@ -26,9 +26,18 @@ A Sonar-style mixer. The program becomes your PC's audio output, splits sound in
 
 Use one output or two: leave Stream Mix empty for one, or pick a device for both.
 
+## Windows default bar
+If Windows isn't using the mixer as its default output, a bar appears across the top with
+**Click to auto set defaults**. Click it and the app switches Windows to the default channel
+(Game unless you change it under *Windows output*). The app also does this by itself at startup.
+
 ## If sound ever goes missing
 Re-open the app (closing it normally restores your original Windows output), or choose your
 speakers in Windows Settings > System > Sound.
+
+## If the app crashes or misbehaves
+Open `%APPDATA%\SaltysStreamMixer\` (paste that into File Explorer's address bar). Two files help:
+`app.log` (what the app was doing) and `crash.log` (errors). Send both when reporting a problem.
 
 ## For developers
 `pip install -r requirements.txt`, put `SoundVolumeView.exe` next to the script, then
