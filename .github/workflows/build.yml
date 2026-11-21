@@ -38,8 +38,6 @@ jobs:
           --add-binary "SoundVolumeView.exe;."
           --add-data "version.txt;."
           --collect-all sounddevice
-          --collect-submodules pycaw
-          --collect-submodules comtypes
           saltys_stream_mixer.py
 
       - name: Read version
